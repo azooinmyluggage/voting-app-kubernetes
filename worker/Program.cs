@@ -1,18 +1,21 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Threading;
-using System.Threading.Tasks;
-using Microsoft.WindowsAzure.Storage;
-using Microsoft.WindowsAzure.Storage.Queue;
-using Microsoft.WindowsAzure.Storage.Table;
-using Newtonsoft.Json;
-
-namespace worker
+﻿namespace worker
 {
+    using Newtonsoft.Json;
+    using Microsoft.WindowsAzure.Storage;
+    using Microsoft.WindowsAzure.Storage.Queue;
+    using System;
+    using System.Data.SqlClient;
+    using System.Text;
+    using System.Threading;
+    using System.Threading.Tasks;
+
     class Program
     {
         static string StorageAccountName = Environment.GetEnvironmentVariable("AZURE_STORAGE_ACCOUNT").Trim();
         static string StorageAccountKey = Environment.GetEnvironmentVariable("AZURE_STORAGE_ACCESS_KEY").Trim();
+	static string SQLHostName = Environment.GetEnvironmentVariable("SQL_HOSTNAME").Trim();
+        static string SQLUserName = Environment.GetEnvironmentVariable("SQL_USERNAME").Trim();
+        static string SQLPassword = Environment.GetEnvironmentVariable("SQL_PASSWORD").Trim();
 
         static void Main(string[] args)
         {
@@ -25,12 +28,14 @@ namespace worker
             };
 
             Console.WriteLine($"StorageAccountName: {StorageAccountName}");
-            if (String.IsNullOrEmpty(StorageAccountName)) {
+            if (String.IsNullOrEmpty(StorageAccountName))
+            {
                 throw new ArgumentNullException(nameof(StorageAccountName));
             }
 
             Console.WriteLine($"StorageAccountKey: {StorageAccountKey}");
-            if (String.IsNullOrEmpty(StorageAccountKey)) {
+            if (String.IsNullOrEmpty(StorageAccountKey))
+            {
                 throw new ArgumentNullException(nameof(StorageAccountKey));
             }
 
@@ -40,74 +45,67 @@ namespace worker
             var queue = queueClient.GetQueueReference("votes");
             queue.CreateIfNotExistsAsync().Wait(cts.Token);
 
-            var tableClient = storageAccount.CreateCloudTableClient();
-            var table = tableClient.GetTableReference("votes");
-            table.CreateIfNotExistsAsync().Wait(cts.Token);
+            var sqlConnectionbuilder = new SqlConnectionStringBuilder()
+            {
+                DataSource = SQLHostName,
+                UserID = SQLUserName,
+                Password = SQLPassword,
+                InitialCatalog = "VOTEDB"
+            };
 
+	    Console.WriteLine($"SQL ConnectionString: {sqlConnectionbuilder.ConnectionString}");
             Console.WriteLine($"Starting worker...");
 
-            try {
-                while (!cts.IsCancellationRequested) {
-                    CheckQueueAsync(queue, table).Wait(cts.Token);
+            using (var sqlConnection = new SqlConnection(sqlConnectionbuilder.ConnectionString))
+            {
+                sqlConnection.Open();
+
+                try
+                {
+                    while (!cts.IsCancellationRequested)
+                    {
+                        CheckQueueAsync(queue, sqlConnection).Wait(cts.Token);
+                    }
                 }
-            } catch (OperationCanceledException) {
-                // swallow
-            } finally {
-                cts.Dispose();
+                catch (OperationCanceledException)
+                {
+                    // swallow
+                }
+                finally
+                {
+                    cts.Dispose();
+                }
             }
         }
 
-        private static async Task CheckQueueAsync(CloudQueue queue, CloudTable table) 
+        private static async Task CheckQueueAsync(CloudQueue queue, SqlConnection sqlConnection)
         {
             CloudQueueMessage retrievedMessage = await queue.GetMessageAsync();
-
-            if (retrievedMessage == null) {
+            if (retrievedMessage == null)
+            {
                 return;
             }
 
             dynamic record = JsonConvert.DeserializeObject(retrievedMessage.AsString);
             Console.WriteLine($"Processing {record.voter_id} with {record.vote}");
+            var sb = new StringBuilder();
+            sb.AppendLine($"UPDATE votes SET vote='{record.vote}' where id='{record.voter_id}'");
+            sb.AppendLine("IF @@ROWCOUNT = 0");
+            sb.AppendLine($"INSERT INTO votes VALUES('{record.voter_id}', '{record.vote}')");
+	    var sql = sb.ToString();
+            var command = new SqlCommand(sql, sqlConnection);
+            command.ExecuteNonQuery();
 
-            await table.CreateIfNotExistsAsync();
+	    // Update counts
+	    sb.Clear();
+	    sb.AppendLine("UPDATE voteCount");
+	    sb.AppendLine("SET count=(SELECT COUNT(*) FROM votes WHERE votes.vote=voteCount.vote)");
+            sql = sb.ToString();
+            command = new SqlCommand(sql, sqlConnection);
+            command.ExecuteNonQuery();
 
-            // vote 
-            var voteEntity = new VoteEntity((string)record.voter_id, (string)record.vote);
-            await table.ExecuteAsync(TableOperation.InsertOrReplace(voteEntity));
-
-            // vote count 
-            var batchOperation = new TableBatchOperation();
-            foreach (var voteCount in await GetVoteCount(table))
-            {
-                batchOperation.InsertOrReplace(new VoteCountEntity(voteCount.Key, voteCount.Value));
-            }
-            await table.ExecuteBatchAsync(batchOperation);
+	    // Message processing completed
             await queue.DeleteMessageAsync(retrievedMessage);
-        }
-
-        private static async Task<IDictionary<string, int>> GetVoteCount(CloudTable table)
-        {
-            string filter = TableQuery.GenerateFilterCondition("PartitionKey", QueryComparisons.Equal, VoteEntity.PK);
-            TableQuery<VoteEntity> tableQuery = new TableQuery<VoteEntity>().Where(filter);
-            TableContinuationToken continuationToken = null;
-
-            var voteCounts = new Dictionary<string, int>()
-            {
-                { "a", 0 },
-                { "b", 0 },
-            };
-
-            do
-            {
-                var rows = await table.ExecuteQuerySegmentedAsync(tableQuery, continuationToken);
-                foreach (var row in rows)
-                {
-                    voteCounts[row.Vote]++;
-                }
-
-                continuationToken = rows.ContinuationToken;
-            } while (continuationToken != null);
-
-            return voteCounts;
         }
     }
 }
